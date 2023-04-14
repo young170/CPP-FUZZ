@@ -15,10 +15,10 @@ namespace fs = std::filesystem;
 
 
 int main(int argc, char* argv[]) {
-    std::map<std::string, std::string> input_options = parse_input_options();
+    std::map<std::string, std::string> input_options = parse_input_options(argc, argv);
 
 	// get the directory path of the to-be-compiled files, input_options.directory
-    std::string directory_path = input_options.at("directory_path");
+    std::string directory_path = input_options.at("directory");
 	// get the executable files of the compiled files
     std::vector<std::string> cpp_files = find_files(directory_path);
 
@@ -35,7 +35,7 @@ int main(int argc, char* argv[]) {
 
 	// execute each .out executable binary file
 	for (const std::string exe_file : exe_files) {
-        program_exe(exe_file);
+        program_exe(exe_file, input_options.at("lower"), input_options.at("upper"), input_options.at("range"));
     }
 
     return 0;
@@ -45,7 +45,9 @@ int main(int argc, char* argv[]) {
 // main functions: execute program & generate fuzzed inputs
 //////////////////////////////////////////////////////////////
 
-void program_exe(std::string exe_file) {
+// execute the target program using fuzzed inputs
+// communicate to decide if it is semi-passed, via pipe
+void program_exe(std::string exe_file, std::string lower_bound, std::string upper_bound, std::string range) {
 	int to_child_FD[2];
 	int to_parent_FD[2];
 
@@ -78,51 +80,69 @@ void program_exe(std::string exe_file) {
 		dup2(to_parent_FD[1], STDERR_FILENO);	// macro : 2
 
 		// get the fuzz inputs
-		std::vector<std::string> fuzz_inputs = generate_fuzz_inputs();
+		std::vector<std::string> fuzz_inputs = generate_fuzz_inputs(std::stoi(lower_bound), std::stoi(upper_bound), std::stoi(range));
+        std::vector<char*> fuzz_inputs_placeholder;
+
+		// allocate memory for each string and copy its contents to a char array
+		for (const auto& input : fuzz_inputs) {
+			char* str = new char[input.length() + 1];
+			std::strcpy(str, input.c_str());
+
+			fuzz_inputs_placeholder.push_back(str);
+		}
+
+		// convert the vector of char* pointers to a char** array
+		char** fuzz_arguments = fuzz_inputs_placeholder.data();
 
 		// child process executes binary file
 		// the *argv[] for the child process is generated from the fuzz_options() function
-		if (execv(exe_file, fuzz_inputs) == -1) {
+		if (execv(exe_file.c_str(), fuzz_arguments) == -1) {
 			fprintf(stderr, "child process failed..\n");
 			exit(1);
 		}
 	}
 
-	// parent process 
-	close(to_child_FD[0]);	// close read
-	close(to_parent_FD[1]);	// close write
+	// // parent process 
+	// close(to_child_FD[0]);	// close read
+	// close(to_parent_FD[1]);	// close write
 
-	// write to pipe_to_child - stdin
-	write(to_child_FD[1], input, strlen(input));
+	// // write to pipe_to_child - stdin
+	// // write(to_child_FD[1], input, strlen(input));
 
-	// need to close write pipe - or else it constantly waits for input
-	close(to_child_FD[1]);
+	// // need to close write pipe - or else it constantly waits for input
+	// close(to_child_FD[1]);
 
-	waitpid(child_pid, &status, 0);
+	// waitpid(child_pid, &status, 0);
 
-	char* buf = (char*) malloc(sizeof(char) * BUFSIZ);
-	// recieve the output of child via stderr using unnamed pipe
-	int num_of_bytes = read(to_parent_FD[0], buf, BUFSIZ);
-	buf[num_of_bytes] = '\0';
-	// printf("%s\n", buf);
+	// char* buf = (char*) malloc(sizeof(char) * BUFSIZ);
+	// // recieve the output of child via stderr using unnamed pipe
+	// int num_of_bytes = read(to_parent_FD[0], buf, BUFSIZ);
+	// buf[num_of_bytes] = '\0';
+	// // printf("%s\n", buf);
 
-	close(to_parent_FD[0]);
+	// close(to_parent_FD[0]);
 }
 
-std::vector<std::string> generate_fuzz_inputs(const std::string& input, int range, int numInputs) {
-	std::random_device rd;  // obtain a random seed from the system
-    std::mt19937 gen(rd()); // seed the random number generator
-    std::uniform_int_distribution<> dis(-range, range); // define the range of mutation
+// generate fuzz inputs based on the range given to the paraments
+std::vector<std::string> generate_fuzz_inputs(int lower_bound, int upper_bound, int range) {
+	std::vector<std::string> fuzzed_inputs;
 
-    std::vector<std::string> fuzzedInputs(numInputs); // create a vector to hold the fuzzing inputs
-    for (int i = 0; i < numInputs; i++) {
-        int mutatedInput = std::stoi(input) + dis(gen); // generate a mutated input within the given range
-        if (mutatedInput < 0) { // ensure mutated input is non-negative
-            mutatedInput = 0;
-        }
-        fuzzedInputs[i] = std::to_string(mutatedInput); // convert the mutated input to a string and store it in the vector
+    std::random_device rd;
+    std::mt19937 gen(rd());
+	// change the range of mutations
+    std::uniform_int_distribution<> dis(-100, 100);
+
+    for (int i = 0; i < range; i++) {
+        // add the integer value as a string to the vector
+        fuzzed_inputs.push_back(std::to_string(i));
+
+        // mutate the integer value by adding or subtracting a random number
+        int mutation = dis(gen);
+        int mutated = std::clamp(i + mutation, lower_bound, upper_bound); // Clamp mutated value to range
+        fuzzed_inputs.push_back(std::to_string(mutated));
     }
-    return fuzzedInputs;
+
+    return fuzzed_inputs;
 }
 
 //////////////////////////////////////////////////////////////
@@ -130,35 +150,46 @@ std::vector<std::string> generate_fuzz_inputs(const std::string& input, int rang
 //////////////////////////////////////////////////////////////
 
 // parse the input options given in the command line
-std::map<std::string, std::string> parse_input_options() {
-    boost::program_options::options_description desc("Allowed options");
+std::map<std::string, std::string> parse_input_options(int argc, char* argv[]) {
     std::map<std::string, std::string> input_options;
+    int opt;
+    std::string arg1, arg2, arg3, lower_bound, upper_bound, range;
 
-    desc.add_options()
-        ("help", "produce help message")
-        ("input", boost::program_options::value<std::string>(), "input file")
-        ("output", boost::program_options::value<std::string>(), "output file")
-    ;
-
-    boost::program_options::variables_map vm;
-    boost::program_options::store(boost::program_options::parse_command_line(argc, argv, desc), vm);
-    boost::program_options::notify(vm);
-
-    if (vm.count("help")) {
-        std::cout << desc << std::endl;
-        return;
-    }
-
-    if (vm.count("input")) {
-        std::string input_file = vm["input"].as<std::string>();
-        input_options["input_file"] = input_file;
-        std::cout << "Input file: " << input_file << std::endl;
-    }
-
-    if (vm.count("output")) {
-        std::string output_file = vm["output"].as<std::string>();
-		input_options["output_file"] = output_file;
-        std::cout << "Output file: " << output_file << std::endl;
+    while ((opt = getopt(argc, argv, "i:o:d:lb:ub:r:")) != -1) {
+        switch (opt) {
+            case 'i': {
+                arg1 = arg1.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(arg1, "input") );
+                break;
+            }
+            case 'o': {
+                arg2 = arg2.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(arg2, "output") );
+                break;
+            }
+            case 'd': {
+                arg3 = arg3.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(arg3, "directory") );
+                break;
+            }
+			case 'lb': {
+                lower_bound = lower_bound.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(lower_bound, "lower") );
+                break;
+            }
+			case 'ub': {
+                upper_bound = upper_bound.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(upper_bound, "upper") );
+                break;
+            }
+			case 'r': {
+                range = range.assign(optarg);
+                input_options.insert( std::pair<std::string, std::string>(range, "range") );
+                break;
+            }
+            default:
+                std::cerr << "Usage: " << argv[0] << " -i <arg1> -o <arg2> -d <arg3> -lb <lower_bound> -ub <upper_bound> -r <range>" << std::endl;
+        }
     }
 
 	return input_options;
